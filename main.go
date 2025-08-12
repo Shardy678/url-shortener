@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
+	"errors"
 	"log"
 	"math/big"
 	"net"
@@ -13,42 +15,16 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	uaParser "github.com/mssola/user_agent"
+	"github.com/redis/go-redis/v9"
 )
 
 var (
 	alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-	store    = newMemStore()
-	events   = newAnalyticsStore()
+	cacheTTL = time.Hour * 24
 )
-
-type memStore struct {
-	mu   sync.RWMutex
-	data map[string]string
-}
-
-func newMemStore() *memStore {
-	return &memStore{
-		data: map[string]string{},
-	}
-}
-
-func (m *memStore) get(code string) (string, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	v, ok := m.data[code]
-	return v, ok
-}
-
-func (m *memStore) set(code, url string) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if _, exists := m.data[code]; exists {
-		return false
-	}
-	m.data[code] = url
-	return true
-}
 
 /* -------------------- analytics -------------------- */
 
@@ -131,14 +107,122 @@ func parseUA(uaStr string) (device, os, browser string) {
 	return
 }
 
+/* -------------------- persistence & caching -------------------- */
+
+var ErrConflict = errors.New("slug already exists")
+
+type repo interface {
+	Create(ctx context.Context, code, url string) error
+	Get(ctx context.Context, code string) (string, bool, error)
+}
+
+type pgRepo struct{ pool *pgxpool.Pool }
+
+type redisCache struct{ client *redis.Client }
+
+func newPGRepo(ctx context.Context, dsn string) (*pgRepo, error) {
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	return &pgRepo{pool: pool}, nil
+}
+
+func (r *pgRepo) Create(ctx context.Context, code, url string) error {
+	ct, err := r.pool.Exec(ctx, "INSERT INTO urls (code, target_url) VALUES ($1, $2) ON CONFLICT (code) DO NOTHING", code, url)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrConflict
+	}
+	return err
+}
+
+func (r *pgRepo) Get(ctx context.Context, code string) (string, bool, error) {
+	var url string
+	err := r.pool.QueryRow(ctx, "SELECT target_url FROM urls WHERE code=$1", code).Scan(&url)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	return url, true, nil
+}
+
+func newRedis(addr, password string, db int) *redisCache {
+	client := redis.NewClient(&redis.Options{Addr: addr, Password: password, DB: db})
+	return &redisCache{client: client}
+}
+
+func (c *redisCache) key(code string) string { return "url:" + code }
+
+func (c *redisCache) Get(ctx context.Context, code string) (string, bool, error) {
+	if c == nil || c.client == nil {
+		return "", false, nil
+	}
+	v, err := c.client.Get(ctx, c.key(code)).Result()
+	if err == redis.Nil {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return v, true, nil
+}
+
+func (c *redisCache) Set(ctx context.Context, code, url string, ttl time.Duration) error {
+	if c == nil || c.client == nil {
+		return nil
+	}
+	return c.client.Set(ctx, c.key(code), url, ttl).Err()
+}
+
 /* -------------------- server -------------------- */
 
 func main() {
+	ctx := context.Background()
 	port := getenv("PORT", "8080")
 	baseURL := getenv("BASE_URL", "http://localhost:"+port)
 	idLen := 7
 
+	if ttlSec := getenv("CACHE_TTL_SECONDS", ""); ttlSec != "" {
+		if n, err := strconv.Atoi(ttlSec); err == nil && n > 0 {
+			cacheTTL = time.Duration(n) * time.Second
+		}
+	}
+
+	pgURL := mustEnv("DATABASE_URL")
+	pg, err := newPGRepo(ctx, pgURL)
+	if err != nil {
+		log.Fatalf("failed to connect to postgres: %v", err)
+	}
+	defer pg.pool.Close()
+
+	redisAddr := getenv("REDIS_ADDR", "")
+	var rc *redisCache
+	if redisAddr != "" {
+		redisPass := getenv("REDIS_PASSWORD", "")
+		redisDB := 0
+		if v := getenv("REDIS_DB", ""); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				redisDB = n
+			}
+		}
+		rc = newRedis(redisAddr, redisPass, redisDB)
+		if err := rc.client.Ping(ctx).Err(); err != nil {
+			log.Printf("warning: redis ping failed: %v (continuing without cache)", err)
+			rc = nil
+		} else {
+			log.Printf("redis connected")
+		}
+	}
+
+	events := newAnalyticsStore()
+
 	r := gin.Default()
+
 	r.POST("/api/shorten", func(c *gin.Context) {
 		var req struct {
 			URL  string `json:"url" binding:"required,url"`
@@ -156,9 +240,30 @@ func main() {
 			code = genID(idLen)
 		}
 
-		if ok := store.set(code, req.URL); !ok {
-			c.JSON(http.StatusConflict, gin.H{"error": "slug already exists"})
+		var createErr error
+		for attempt := 0; attempt < 5; attempt++ {
+			createErr = pg.Create(c.Request.Context(), code, req.URL)
+			if createErr == nil {
+				break
+			}
+			if errors.Is(createErr, ErrConflict) {
+				if req.Slug != "" {
+					c.JSON(http.StatusConflict, gin.H{"error": "slug already exists"})
+					return
+				}
+				code = genID(idLen)
+				continue
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "db error"})
 			return
+		}
+		if createErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not generate unique id"})
+			return
+		}
+
+		if rc != nil {
+			_ = rc.Set(c.Request.Context(), code, req.URL, cacheTTL)
 		}
 
 		short := strings.TrimRight(baseURL, "/") + "/" + code
@@ -184,29 +289,52 @@ func main() {
 
 	r.GET("/:code", func(c *gin.Context) {
 		code := c.Param("code")
+		ctx := c.Request.Context()
 
-		url, exists := store.get(code)
+		if rc != nil {
+			if url, ok, err := rc.Get(ctx, code); err == nil && ok {
+				recordAndRedirect(c, events, code, url)
+				return
+			}
+		}
+
+		url, exists, err := pg.Get(ctx, code)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "db error"})
+			return
+		}
 		if !exists {
 			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 			return
 		}
 
-		ua := c.Request.UserAgent()
-		device, osName, browser := parseUA(ua)
-		e := Event{
-			Timestamp: time.Now().UTC(),
-			IP:        getClientIP(c.Request),
-			UserAgent: ua,
-			Device:    device,
-			OS:        osName,
-			Browser:   browser,
+		if rc != nil {
+			_ = rc.Set(ctx, code, url, cacheTTL)
 		}
-		events.add(code, e)
+		recordAndRedirect(c, events, code, url)
+	})
 
-		c.Redirect(http.StatusFound, url)
+	r.GET("/healthz", func(c *gin.Context) {
+		c.JSON(200, gin.H{"ok": true})
 	})
 
 	_ = r.Run(":" + port)
+}
+
+func recordAndRedirect(c *gin.Context, events *analyticsStore, code, url string) {
+	ua := c.Request.UserAgent()
+	device, osName, browser := parseUA(ua)
+
+	e := Event{
+		Timestamp: time.Now().UTC(),
+		IP:        getClientIP(c.Request),
+		UserAgent: ua,
+		Device:    device,
+		OS:        osName,
+		Browser:   browser,
+	}
+	events.add(code, e)
+	c.Redirect(http.StatusFound, url)
 }
 
 func genID(n int) string {
@@ -223,4 +351,12 @@ func getenv(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func mustEnv(k string) string {
+	v := os.Getenv(k)
+	if v == "" {
+		log.Fatalf("missing required env var %s", k)
+	}
+	return v
 }
