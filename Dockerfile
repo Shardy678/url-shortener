@@ -4,7 +4,7 @@ FROM golang:1.24.4-alpine AS builder
 WORKDIR /app
 
 # Cache deps
-COPY go.mod go.sum ./
+COPY go.mod go.sum token_bucket.lua ./
 RUN go mod download
 
 # Copy source
@@ -21,6 +21,8 @@ WORKDIR /app
 RUN apk add --no-cache curl
 
 COPY --from=builder /app/app /app/app
+COPY --from=builder /app/token_bucket.lua /app/token_bucket.lua  
+
 
 ENV PORT=8080
 EXPOSE 8080

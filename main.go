@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"log"
+	"math"
 	"math/big"
 	"net"
 	"net/http"
@@ -179,6 +181,85 @@ func (c *redisCache) Set(ctx context.Context, code, url string, ttl time.Duratio
 	return c.client.Set(ctx, c.key(code), url, ttl).Err()
 }
 
+/* -------------------- rate limiting -------------------- */
+
+type Limiter interface {
+	Allow(ctx context.Context, key string) (bool, time.Duration, error)
+}
+
+type redisLimiter struct {
+	rps    float64
+	burst  int
+	redis  *redis.Client
+	prefix string
+	script *redis.Script
+}
+
+func newRedisLimiter(rps float64, burst int, rc *redis.Client, scripthPath string) (*redisLimiter, error) {
+	code, err := os.ReadFile(scripthPath)
+	if err != nil {
+		return nil, fmt.Errorf("read lua file: %w", err)
+	}
+	return &redisLimiter{rps: rps, burst: burst, redis: rc, prefix: "rl:", script: redis.NewScript(string(code))}, nil
+}
+
+func loadLuaScript(path string) (*redis.Script, error) {
+	code, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read lua file: %w", err)
+	}
+	return redis.NewScript(string(code)), nil
+}
+
+func (l *redisLimiter) Allow(ctx context.Context, key string) (bool, time.Duration, error) {
+	if l.redis == nil || l.script == nil {
+		return true, 0, nil
+	}
+	now := time.Now().UnixMilli()
+	res, err := l.script.Run(ctx, l.redis, []string{l.prefix + key}, now, l.rps, l.burst).Result()
+	if err != nil {
+		return true, 0, nil
+	}
+	arr, ok := res.([]any)
+	if !ok || len(arr) < 2 {
+		return true, 0, nil
+	}
+
+	allowedInt, _ := arr[0].(int64)
+	allowed := allowedInt == 1
+
+	var tokens float64
+	switch v := arr[1].(type) {
+	case float64:
+		tokens = v
+	case string:
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			tokens = f
+		}
+	}
+	if allowed {
+		return true, 0, nil
+	}
+
+	waitMs := math.Ceil((1.0 - tokens) / l.rps * 1000.0)
+	if waitMs < 100 {
+		waitMs = 100
+	}
+	return false, time.Duration(waitMs) * time.Millisecond, nil
+}
+
+func rateLimitMiddleware(l Limiter, keyFunc func(*http.Request) string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ok, retryAfter, _ := l.Allow(c.Request.Context(), getClientIP(c.Request))
+		if !ok {
+			if retryAfter > 0 {
+				c.Header("Retry-After", strconv.Itoa(int(retryAfter.Seconds())))
+			}
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "rate limit exceeded"})
+		}
+	}
+}
+
 /* -------------------- server -------------------- */
 
 func main() {
@@ -186,6 +267,19 @@ func main() {
 	port := getenv("PORT", "8080")
 	baseURL := getenv("BASE_URL", "http://localhost:"+port)
 	idLen := 7
+
+	rps := 5.0 // tokens per second
+	if v := getenv("RATE_LIMIT_RPS", ""); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			rps = f
+		}
+	}
+	burst := 20 // bucket size
+	if v := getenv("RATE_LIMIT_BURST", ""); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			burst = n
+		}
+	}
 
 	if ttlSec := getenv("CACHE_TTL_SECONDS", ""); ttlSec != "" {
 		if n, err := strconv.Atoi(ttlSec); err == nil && n > 0 {
@@ -218,12 +312,19 @@ func main() {
 			log.Printf("redis connected")
 		}
 	}
+	var limiter Limiter
+	if rc != nil && rc.client != nil {
+		limiter, err = newRedisLimiter(rps, burst, rc.client, "token_bucket.lua")
+		if err != nil {
+			log.Fatalf("rate limiter: %v", err)
+		}
+	}
 
 	events := newAnalyticsStore()
 
 	r := gin.Default()
 
-	r.POST("/api/shorten", func(c *gin.Context) {
+	r.POST("/api/shorten", rateLimitMiddleware(limiter, getClientIP), func(c *gin.Context) {
 		var req struct {
 			URL  string `json:"url" binding:"required,url"`
 			Slug string `json:"slug"`
