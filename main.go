@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log"
@@ -13,7 +14,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -39,37 +39,12 @@ type Event struct {
 	Browser   string    `json:"browser"`
 }
 
-type analyticsStore struct {
-	mu   sync.RWMutex
-	data map[string][]Event
+type EventWithCode struct {
+	Code string
+	E    Event
 }
 
-func newAnalyticsStore() *analyticsStore {
-	return &analyticsStore{
-		data: make(map[string][]Event),
-	}
-}
-
-func (a *analyticsStore) add(code string, e Event) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.data[code] = append(a.data[code], e)
-}
-
-func (a *analyticsStore) get(code string, limit int) []Event {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	list := a.data[code]
-	if limit <= 0 || limit >= len(list) {
-		out := make([]Event, len(list))
-		copy(out, list)
-		return out
-	}
-	start := len(list) - limit
-	out := make([]Event, limit)
-	copy(out, list[start:])
-	return out
-}
+var clickCh = make(chan EventWithCode, 1024)
 
 func getClientIP(r *http.Request) string {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
@@ -109,14 +84,62 @@ func parseUA(uaStr string) (device, os, browser string) {
 	return
 }
 
+func startClickWorker(pool *pgxpool.Pool) (stop chan struct{}, stopped chan struct{}) {
+	stop = make(chan struct{})
+	stopped = make(chan struct{})
+	go func() {
+		defer close(stopped)
+		buf := make([]EventWithCode, 0, 200)
+		ticker := time.NewTicker(400 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case ev := <-clickCh:
+				buf = append(buf, ev)
+				if len(buf) >= 200 {
+					flushClicks(context.Background(), pool, buf)
+					buf = buf[:0]
+				}
+			case <-ticker.C:
+				if len(buf) > 0 {
+					flushClicks(context.Background(), pool, buf)
+					buf = buf[:0]
+				}
+			case <-stop:
+				if len(buf) > 0 {
+					flushClicks(context.Background(), pool, buf)
+				}
+				return
+			}
+		}
+	}()
+	return
+}
+
+func flushClicks(ctx context.Context, pool *pgxpool.Pool, batch []EventWithCode) {
+	if len(batch) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	sb := strings.Builder{}
+	sb.WriteString("INSERT INTO clicks(code, ts, ip, user_agent, device, os, browser) VALUES ")
+	args := make([]any, 0, len(batch)*7)
+	for i, it := range batch {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		idx := i * 7
+		sb.WriteString(fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,$%d,$%d)", idx+1, idx+2, idx+3, idx+4, idx+5, idx+6, idx+7))
+		args = append(args, it.Code, it.E.Timestamp, it.E.IP, it.E.UserAgent, it.E.Device, it.E.OS, it.E.Browser)
+	}
+	_, _ = pool.Exec(ctx, sb.String(), args...)
+}
+
 /* -------------------- persistence & caching -------------------- */
 
 var ErrConflict = errors.New("slug already exists")
-
-type repo interface {
-	Create(ctx context.Context, code, url string) error
-	Get(ctx context.Context, code string) (string, bool, error)
-}
 
 type pgRepo struct{ pool *pgxpool.Pool }
 
@@ -195,12 +218,12 @@ type redisLimiter struct {
 	script *redis.Script
 }
 
-func newRedisLimiter(rps float64, burst int, rc *redis.Client, scripthPath string) (*redisLimiter, error) {
-	code, err := os.ReadFile(scripthPath)
+func newRedisLimiter(rps float64, burst int, rc *redis.Client, scriptPath string) (*redisLimiter, error) {
+	script, err := loadLuaScript(scriptPath)
 	if err != nil {
-		return nil, fmt.Errorf("read lua file: %w", err)
+		return nil, err
 	}
-	return &redisLimiter{rps: rps, burst: burst, redis: rc, prefix: "rl:", script: redis.NewScript(string(code))}, nil
+	return &redisLimiter{rps: rps, burst: burst, redis: rc, prefix: "rl:", script: script}, nil
 }
 
 func loadLuaScript(path string) (*redis.Script, error) {
@@ -248,15 +271,78 @@ func (l *redisLimiter) Allow(ctx context.Context, key string) (bool, time.Durati
 	return false, time.Duration(waitMs) * time.Millisecond, nil
 }
 
+func shortenHandler(pg *pgRepo, rc *redisCache, baseURL string, idLen int) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req struct {
+			URL  string `json:"url" binding:"required,url"`
+			Slug string `json:"slug"`
+		}
+
+		// validate input
+		if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.URL) == "" {
+			log.Printf("Invalid URL from client: %v", err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+			return
+		}
+
+		// pick code (custom slug or random)
+		code := strings.TrimSpace(req.Slug)
+		if code == "" {
+			code = genID(idLen)
+		}
+
+		// try to create, retry on conflict (regenerate only if no custom slug)
+		var createErr error
+		for attempt := 0; attempt < 5; attempt++ {
+			createErr = pg.Create(c.Request.Context(), code, req.URL)
+			if createErr == nil {
+				break
+			}
+			if errors.Is(createErr, ErrConflict) {
+				// custom slug taken -> immediate 409
+				if req.Slug != "" {
+					c.JSON(http.StatusConflict, gin.H{"error": "slug already exists"})
+					return
+				}
+				// otherwise regenerate and try again
+				code = genID(idLen)
+				continue
+			}
+			// other DB error
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "db error"})
+			return
+		}
+		if createErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not generate unique id"})
+			return
+		}
+
+		// warm cache
+		if rc != nil {
+			_ = rc.Set(c.Request.Context(), code, req.URL, cacheTTL)
+		}
+
+		// respond
+		short := strings.TrimRight(baseURL, "/") + "/" + code
+		c.JSON(http.StatusOK, gin.H{
+			"code":      code,
+			"short_url": short,
+		})
+	}
+}
+
 func rateLimitMiddleware(l Limiter, keyFunc func(*http.Request) string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		ok, retryAfter, _ := l.Allow(c.Request.Context(), getClientIP(c.Request))
+		key := keyFunc(c.Request)
+		ok, retryAfter, _ := l.Allow(c.Request.Context(), key)
 		if !ok {
 			if retryAfter > 0 {
 				c.Header("Retry-After", strconv.Itoa(int(retryAfter.Seconds())))
 			}
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "rate limit exceeded"})
+			return
 		}
+		c.Next()
 	}
 }
 
@@ -320,59 +406,16 @@ func main() {
 		}
 	}
 
-	events := newAnalyticsStore()
-
 	r := gin.Default()
+	h := shortenHandler(pg, rc, baseURL, idLen)
+	if limiter != nil {
+		r.POST("/api/shorten", rateLimitMiddleware(limiter, getClientIP), h)
+	} else {
+		r.POST("/api/shoten", h)
+	}
 
-	r.POST("/api/shorten", rateLimitMiddleware(limiter, getClientIP), func(c *gin.Context) {
-		var req struct {
-			URL  string `json:"url" binding:"required,url"`
-			Slug string `json:"slug"`
-		}
-
-		if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.URL) == "" {
-			log.Printf("Invalid URL from client: %v", err)
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
-			return
-		}
-
-		code := strings.TrimSpace(req.Slug)
-		if code == "" {
-			code = genID(idLen)
-		}
-
-		var createErr error
-		for attempt := 0; attempt < 5; attempt++ {
-			createErr = pg.Create(c.Request.Context(), code, req.URL)
-			if createErr == nil {
-				break
-			}
-			if errors.Is(createErr, ErrConflict) {
-				if req.Slug != "" {
-					c.JSON(http.StatusConflict, gin.H{"error": "slug already exists"})
-					return
-				}
-				code = genID(idLen)
-				continue
-			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "db error"})
-			return
-		}
-		if createErr != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not generate unique id"})
-			return
-		}
-
-		if rc != nil {
-			_ = rc.Set(c.Request.Context(), code, req.URL, cacheTTL)
-		}
-
-		short := strings.TrimRight(baseURL, "/") + "/" + code
-		c.JSON(http.StatusOK, gin.H{
-			"code":      code,
-			"short_url": short,
-		})
-	})
+	stop, stopped := startClickWorker(pg.pool)
+	defer func() { close(stop); <-stopped }()
 
 	r.GET("/api/analytics/:code", func(c *gin.Context) {
 		code := c.Param("code")
@@ -382,9 +425,51 @@ func main() {
 				limit = n
 			}
 		}
+
+		ctx := c.Request.Context()
+
+		var total int64
+		var last *time.Time
+		err := pg.pool.QueryRow(ctx, `
+			SELECT COUNT(*) as total, MAX(ts) AS last
+			FROM clicks WHERE code = $1`, code).Scan(&total, &last)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "db error"})
+			return
+		}
+
+		rows, err := pg.pool.Query(ctx, `
+			SELECT ts, ip, user_agent, device, os, browser
+			FROM clicks WHERE code = $1
+			ORDER BY ts DESC
+			LIMIT $2`, code, limit)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "db error"})
+			return
+		}
+		defer rows.Close()
+
+		eventsOut := make([]Event, 0, limit)
+		for rows.Next() {
+			var e Event
+			var ip sql.NullString
+			if err := rows.Scan(&e.Timestamp, &ip, &e.UserAgent, &e.Device, &e.OS, &e.Browser); err != nil {
+				c.JSON(500, gin.H{"error": "scan error"})
+				return
+			}
+			e.IP = ip.String
+			eventsOut = append(eventsOut, e)
+		}
 		c.JSON(http.StatusOK, gin.H{
-			"code":   code,
-			"events": events.get(code, limit),
+			"code":  code,
+			"total": total,
+			"last_click": func() *time.Time {
+				if last == nil {
+					return nil
+				}
+				return last
+			}(),
+			"recent": eventsOut,
 		})
 	})
 
@@ -394,7 +479,7 @@ func main() {
 
 		if rc != nil {
 			if url, ok, err := rc.Get(ctx, code); err == nil && ok {
-				recordAndRedirect(c, events, code, url)
+				recordAndRedirect(c, code, url)
 				return
 			}
 		}
@@ -412,7 +497,7 @@ func main() {
 		if rc != nil {
 			_ = rc.Set(ctx, code, url, cacheTTL)
 		}
-		recordAndRedirect(c, events, code, url)
+		recordAndRedirect(c, code, url)
 	})
 
 	r.GET("/healthz", func(c *gin.Context) {
@@ -422,11 +507,11 @@ func main() {
 	_ = r.Run(":" + port)
 }
 
-func recordAndRedirect(c *gin.Context, events *analyticsStore, code, url string) {
+func recordAndRedirect(c *gin.Context, code, url string) {
 	ua := c.Request.UserAgent()
 	device, osName, browser := parseUA(ua)
 
-	e := Event{
+	evt := Event{
 		Timestamp: time.Now().UTC(),
 		IP:        getClientIP(c.Request),
 		UserAgent: ua,
@@ -434,13 +519,18 @@ func recordAndRedirect(c *gin.Context, events *analyticsStore, code, url string)
 		OS:        osName,
 		Browser:   browser,
 	}
-	events.add(code, e)
+
+	select {
+	case clickCh <- EventWithCode{Code: code, E: evt}:
+	default:
+	}
+
 	c.Redirect(http.StatusFound, url)
 }
 
 func genID(n int) string {
 	b := make([]byte, n)
-	for i := 0; i < n; i++ {
+	for i := range b {
 		v, _ := rand.Int(rand.Reader, big.NewInt(62))
 		b[i] = alphabet[v.Int64()]
 	}
