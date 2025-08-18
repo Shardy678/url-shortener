@@ -1,5 +1,8 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
 scrape_configs:
   - job_name: 'url-shortener'
-    scrape_interval: 15s
     static_configs:
-      - targets: ['localhost:8080']  # or your service DNS
+      - targets: ['api:8080']   
