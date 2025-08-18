@@ -20,6 +20,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	uaParser "github.com/mssola/user_agent"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -27,6 +29,118 @@ var (
 	alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 	cacheTTL = time.Hour * 24
 )
+
+var (
+	httpRequestsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "http_requests_total",
+			Help: "Total HTTP requests.",
+		},
+		[]string{"method", "route", "status"},
+	)
+	httpRequestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "http_request_duration_seconds",
+			Help:    "Latency of HTTP requests.",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"method", "route", "status"},
+	)
+	redirectsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "redirects_total",
+			Help: "Number of redirects by code.",
+		},
+		[]string{"code"},
+	)
+	rateLimitAllowedTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ratelimit_allowed_total",
+			Help: "Requests allowed by rate limiter.",
+		},
+	)
+	rateLimitDeniedTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ratelimit_denied_total",
+			Help: "Requests denied by rate limiter.",
+		},
+	)
+	rateLimitRetryAfter = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "ratelimit_retry_after_seconds",
+			Help:    "Retry-After seconds for denied requests.",
+			Buckets: []float64{0.1, 0.25, 0.5, 1, 2, 5, 10},
+		},
+	)
+
+	dbOpsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "db_ops_total",
+			Help: "Database operations.",
+		},
+		[]string{"op"}, // create_url, get_url, clicks_insert, analytics_summary, analytics_recent
+	)
+	dbErrorsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "db_errors_total",
+			Help: "Database errors.",
+		},
+		[]string{"op"},
+	)
+
+	cacheHitsTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{Name: "cache_hits_total", Help: "Redis cache hits."},
+	)
+	cacheMissesTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{Name: "cache_misses_total", Help: "Redis cache misses."},
+	)
+	cacheErrorsTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{Name: "cache_errors_total", Help: "Redis cache errors."},
+	)
+
+	clickQueueDepth = prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Name: "click_queue_depth",
+			Help: "Buffered events in click channel.",
+		},
+		func() float64 { return float64(len(clickCh)) },
+	)
+	clickFlushBatchSize = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "click_flush_batch_size",
+			Help:    "Batch size used when flushing clicks.",
+			Buckets: []float64{1, 10, 50, 100, 150, 200, 400},
+		},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(
+		httpRequestsTotal, httpRequestDuration,
+		redirectsTotal,
+		rateLimitAllowedTotal, rateLimitDeniedTotal, rateLimitRetryAfter,
+		dbOpsTotal, dbErrorsTotal,
+		cacheHitsTotal, cacheMissesTotal, cacheErrorsTotal,
+		clickQueueDepth, clickFlushBatchSize,
+	)
+}
+
+func promHTTPMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now()
+		c.Next()
+		dur := time.Since(start).Seconds()
+
+		route := c.FullPath()
+		if route == "" { // for 404s or not-matched routes
+			route = "unmatched"
+		}
+		status := strconv.Itoa(c.Writer.Status())
+
+		httpRequestsTotal.WithLabelValues(c.Request.Method, route, status).Inc()
+		httpRequestDuration.WithLabelValues(c.Request.Method, route, status).Observe(dur)
+	}
+}
 
 /* -------------------- analytics -------------------- */
 
@@ -120,6 +234,8 @@ func flushClicks(ctx context.Context, pool *pgxpool.Pool, batch []EventWithCode)
 	if len(batch) == 0 {
 		return
 	}
+	clickFlushBatchSize.Observe(float64(len(batch)))
+
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
@@ -134,7 +250,10 @@ func flushClicks(ctx context.Context, pool *pgxpool.Pool, batch []EventWithCode)
 		sb.WriteString(fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,$%d,$%d)", idx+1, idx+2, idx+3, idx+4, idx+5, idx+6, idx+7))
 		args = append(args, it.Code, it.E.Timestamp, it.E.IP, it.E.UserAgent, it.E.Device, it.E.OS, it.E.Browser)
 	}
-	_, _ = pool.Exec(ctx, sb.String(), args...)
+	dbOpsTotal.WithLabelValues("clicks_insert").Inc()
+	if _, err := pool.Exec(ctx, sb.String(), args...); err != nil {
+		dbErrorsTotal.WithLabelValues("clicks_insert").Inc()
+	}
 }
 
 /* -------------------- persistence & caching -------------------- */
@@ -154,8 +273,10 @@ func newPGRepo(ctx context.Context, dsn string) (*pgRepo, error) {
 }
 
 func (r *pgRepo) Create(ctx context.Context, code, url string) error {
+	dbOpsTotal.WithLabelValues("create_url").Inc()
 	ct, err := r.pool.Exec(ctx, "INSERT INTO urls (code, target_url) VALUES ($1, $2) ON CONFLICT (code) DO NOTHING", code, url)
 	if err != nil {
+		dbErrorsTotal.WithLabelValues("create_url").Inc()
 		return err
 	}
 	if ct.RowsAffected() == 0 {
@@ -165,12 +286,14 @@ func (r *pgRepo) Create(ctx context.Context, code, url string) error {
 }
 
 func (r *pgRepo) Get(ctx context.Context, code string) (string, bool, error) {
+	dbOpsTotal.WithLabelValues("get_url").Inc()
 	var url string
 	err := r.pool.QueryRow(ctx, "SELECT target_url FROM urls WHERE code=$1", code).Scan(&url)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return "", false, nil
 		}
+		dbErrorsTotal.WithLabelValues("get_url").Inc()
 		return "", false, err
 	}
 	return url, true, nil
@@ -189,11 +312,14 @@ func (c *redisCache) Get(ctx context.Context, code string) (string, bool, error)
 	}
 	v, err := c.client.Get(ctx, c.key(code)).Result()
 	if err == redis.Nil {
+		cacheMissesTotal.Inc()
 		return "", false, nil
 	}
 	if err != nil {
+		cacheErrorsTotal.Inc()
 		return "", false, err
 	}
+	cacheHitsTotal.Inc()
 	return v, true, nil
 }
 
@@ -336,12 +462,14 @@ func rateLimitMiddleware(l Limiter, keyFunc func(*http.Request) string) gin.Hand
 		key := keyFunc(c.Request)
 		ok, retryAfter, _ := l.Allow(c.Request.Context(), key)
 		if !ok {
+			rateLimitDeniedTotal.Inc()
 			if retryAfter > 0 {
 				c.Header("Retry-After", strconv.Itoa(int(retryAfter.Seconds())))
 			}
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "rate limit exceeded"})
 			return
 		}
+		rateLimitAllowedTotal.Inc()
 		c.Next()
 	}
 }
@@ -407,11 +535,14 @@ func main() {
 	}
 
 	r := gin.Default()
+	r.Use(promHTTPMiddleware())
+	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
+
 	h := shortenHandler(pg, rc, baseURL, idLen)
 	if limiter != nil {
 		r.POST("/api/shorten", rateLimitMiddleware(limiter, getClientIP), h)
 	} else {
-		r.POST("/api/shoten", h)
+		r.POST("/api/shorten", h)
 	}
 
 	stop, stopped := startClickWorker(pg.pool)
@@ -433,7 +564,9 @@ func main() {
 		err := pg.pool.QueryRow(ctx, `
 			SELECT COUNT(*) as total, MAX(ts) AS last
 			FROM clicks WHERE code = $1`, code).Scan(&total, &last)
+		dbOpsTotal.WithLabelValues("analytics_summary").Inc()
 		if err != nil {
+			dbErrorsTotal.WithLabelValues("analytics_summary").Inc()
 			c.JSON(500, gin.H{"error": "db error"})
 			return
 		}
@@ -443,7 +576,9 @@ func main() {
 			FROM clicks WHERE code = $1
 			ORDER BY ts DESC
 			LIMIT $2`, code, limit)
+		dbOpsTotal.WithLabelValues("analytics_recent").Inc()
 		if err != nil {
+			dbErrorsTotal.WithLabelValues("analytics_recent").Inc()
 			c.JSON(500, gin.H{"error": "db error"})
 			return
 		}
@@ -471,6 +606,10 @@ func main() {
 			}(),
 			"recent": eventsOut,
 		})
+	})
+
+	r.GET("/favicon.ico", func(c *gin.Context) {
+		c.Status(http.StatusNoContent)
 	})
 
 	r.GET("/:code", func(c *gin.Context) {
@@ -525,6 +664,7 @@ func recordAndRedirect(c *gin.Context, code, url string) {
 	default:
 	}
 
+	redirectsTotal.WithLabelValues(code).Inc()
 	c.Redirect(http.StatusFound, url)
 }
 
