@@ -130,5 +130,5 @@ docker compose up --build
    Приложение  → http://localhost:8080
    Healthcheck → http://localhost:8080/healthz
    Метрики    → http://localhost:8080/metrics
-   Grafana    → http://localhost:9090
+   Grafana    → http://localhost:3000
 ```
