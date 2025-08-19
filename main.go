@@ -12,8 +12,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -25,93 +27,110 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-var (
-	alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-	cacheTTL = time.Hour * 24
-)
+/* -------------------------------------------------------------------------- */
+/*                                   Конфиг                                   */
+/* -------------------------------------------------------------------------- */
+
+type Config struct {
+	Port             string
+	BaseURL          string
+	IDLen            int
+	DBURL            string
+	RedisAddr        string
+	RedisPassword    string
+	RedisDB          int
+	CacheTTL         time.Duration
+	RateLimitRPS     float64
+	RateLimitBurst   int
+	RateLimitLuaPath string
+	ClickBufSize     int
+	ClickFlushEvery  time.Duration
+	ShutdownGrace    time.Duration
+}
+
+func loadConfig() Config {
+	cfg := Config{
+		Port:             getenv("PORT", "8080"),
+		IDLen:            atoi(getenv("ID_LEN", "7"), 7),
+		DBURL:            mustEnv("DATABASE_URL"),
+		RedisAddr:        getenv("REDIS_ADDR", ""),
+		RedisPassword:    getenv("REDIS_PASSWORD", ""),
+		RedisDB:          atoi(getenv("REDIS_DB", "0"), 0),
+		CacheTTL:         dur(getenv("CACHE_TTL", "24h"), 24*time.Hour),
+		RateLimitRPS:     atof(getenv("RATE_LIMIT_RPS", "5"), 5),
+		RateLimitBurst:   atoi(getenv("RATE_LIMIT_BURST", "20"), 20),
+		RateLimitLuaPath: getenv("RATE_LIMIT_LUA", "token_bucket.lua"),
+		ClickBufSize:     atoi(getenv("CLICK_BUFFER", "1024"), 1024),
+		ClickFlushEvery:  dur(getenv("CLICK_FLUSH_EVERY", "400ms"), 400*time.Millisecond),
+		ShutdownGrace:    dur(getenv("SHUTDOWN_GRACE", "8s"), 8*time.Second),
+	}
+	cfg.BaseURL = getenv("BASE_URL", "http://localhost:"+cfg.Port)
+	return cfg
+}
+
+func atoi(s string, def int) int {
+	if n, err := strconv.Atoi(s); err == nil {
+		return n
+	}
+	return def
+}
+func atof(s string, def float64) float64 {
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		return f
+	}
+	return def
+}
+func dur(s string, def time.Duration) time.Duration {
+	if d, err := time.ParseDuration(s); err == nil {
+		return d
+	}
+	return def
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                Обсервабилити                               */
+/* -------------------------------------------------------------------------- */
 
 var (
+	alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
 	httpRequestsTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "http_requests_total",
-			Help: "Total HTTP requests.",
-		},
+		prometheus.CounterOpts{Name: "http_requests_total", Help: "Total HTTP requests."},
 		[]string{"method", "route", "status"},
 	)
 	httpRequestDuration = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "http_request_duration_seconds",
-			Help:    "Latency of HTTP requests.",
-			Buckets: prometheus.DefBuckets,
-		},
+		prometheus.HistogramOpts{Name: "http_request_duration_seconds", Help: "Latency of HTTP requests.", Buckets: prometheus.DefBuckets},
 		[]string{"method", "route", "status"},
 	)
 	redirectsTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "redirects_total",
-			Help: "Number of redirects by code.",
-		},
+		prometheus.CounterOpts{Name: "redirects_total", Help: "Number of redirects by code."},
 		[]string{"code"},
 	)
 	rateLimitAllowedTotal = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "ratelimit_allowed_total",
-			Help: "Requests allowed by rate limiter.",
-		},
+		prometheus.CounterOpts{Name: "ratelimit_allowed_total", Help: "Requests allowed by rate limiter."},
 	)
 	rateLimitDeniedTotal = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "ratelimit_denied_total",
-			Help: "Requests denied by rate limiter.",
-		},
+		prometheus.CounterOpts{Name: "ratelimit_denied_total", Help: "Requests denied by rate limiter."},
 	)
 	rateLimitRetryAfter = prometheus.NewHistogram(
-		prometheus.HistogramOpts{
-			Name:    "ratelimit_retry_after_seconds",
-			Help:    "Retry-After seconds for denied requests.",
-			Buckets: []float64{0.1, 0.25, 0.5, 1, 2, 5, 10},
-		},
+		prometheus.HistogramOpts{Name: "ratelimit_retry_after_seconds", Help: "Retry-After seconds for denied requests.", Buckets: []float64{0.1, 0.25, 0.5, 1, 2, 5, 10}},
 	)
 
 	dbOpsTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "db_ops_total",
-			Help: "Database operations.",
-		},
+		prometheus.CounterOpts{Name: "db_ops_total", Help: "Database operations."},
 		[]string{"op"},
 	)
 	dbErrorsTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "db_errors_total",
-			Help: "Database errors.",
-		},
+		prometheus.CounterOpts{Name: "db_errors_total", Help: "Database errors."},
 		[]string{"op"},
 	)
 
-	cacheHitsTotal = prometheus.NewCounter(
-		prometheus.CounterOpts{Name: "cache_hits_total", Help: "Redis cache hits."},
-	)
-	cacheMissesTotal = prometheus.NewCounter(
-		prometheus.CounterOpts{Name: "cache_misses_total", Help: "Redis cache misses."},
-	)
-	cacheErrorsTotal = prometheus.NewCounter(
-		prometheus.CounterOpts{Name: "cache_errors_total", Help: "Redis cache errors."},
-	)
+	cacheHitsTotal   = prometheus.NewCounter(prometheus.CounterOpts{Name: "cache_hits_total", Help: "Redis cache hits."})
+	cacheMissesTotal = prometheus.NewCounter(prometheus.CounterOpts{Name: "cache_misses_total", Help: "Redis cache misses."})
+	cacheErrorsTotal = prometheus.NewCounter(prometheus.CounterOpts{Name: "cache_errors_total", Help: "Redis cache errors."})
 
-	clickQueueDepth = prometheus.NewGaugeFunc(
-		prometheus.GaugeOpts{
-			Name: "click_queue_depth",
-			Help: "Buffered events in click channel.",
-		},
-		func() float64 { return float64(len(clickCh)) },
-	)
-	clickFlushBatchSize = prometheus.NewHistogram(
-		prometheus.HistogramOpts{
-			Name:    "click_flush_batch_size",
-			Help:    "Batch size used when flushing clicks.",
-			Buckets: []float64{1, 10, 50, 100, 150, 200, 400},
-		},
-	)
+	clickQueueDepth     = prometheus.NewGauge(prometheus.GaugeOpts{Name: "click_queue_depth", Help: "Buffered events in click channel."})
+	clickFlushBatchSize = prometheus.NewHistogram(prometheus.HistogramOpts{Name: "click_flush_batch_size", Help: "Batch size used when flushing clicks.", Buckets: []float64{1, 10, 50, 100, 150, 200, 400}})
 )
 
 func init() {
@@ -142,7 +161,9 @@ func promHTTPMiddleware() gin.HandlerFunc {
 	}
 }
 
-/* -------------------- analytics -------------------- */
+/* -------------------------------------------------------------------------- */
+/*                                  Analytics                                 */
+/* -------------------------------------------------------------------------- */
 
 type Event struct {
 	Timestamp time.Time `json:"timestamp"`
@@ -158,91 +179,78 @@ type EventWithCode struct {
 	E    Event
 }
 
-var clickCh = make(chan EventWithCode, 1024)
-
-func getClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		for _, part := range strings.Split(xff, ",") {
-			ip := strings.TrimSpace(part)
-			if ip != "" {
-				return ip
-			}
-		}
-	}
-	if xrip := r.Header.Get("X-Real-IP"); xrip != "" {
-		return strings.TrimSpace(xrip)
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
+type Worker struct {
+	buf        []EventWithCode
+	flushEvery time.Duration
+	maxBatch   int
+	ch         chan EventWithCode
+	stop       chan struct{}
+	stopped    chan struct{}
+	pool       *pgxpool.Pool
 }
 
-func parseUA(uaStr string) (device, os, browser string) {
-	ua := uaParser.New(uaStr)
-
-	browserName, _ := ua.Browser()
-	browser = browserName
-	os = ua.OS()
-
-	switch {
-	case ua.Bot():
-		device = "bot"
-	case ua.Mobile():
-		device = "mobile"
-	default:
-		device = "desktop"
+func newWorker(pool *pgxpool.Pool, bufSize, maxBatch int, flushEvery time.Duration) *Worker {
+	w := &Worker{
+		buf:        make([]EventWithCode, 0, maxBatch),
+		flushEvery: flushEvery,
+		maxBatch:   maxBatch,
+		ch:         make(chan EventWithCode, bufSize),
+		stop:       make(chan struct{}),
+		stopped:    make(chan struct{}),
+		pool:       pool,
 	}
-
-	return
+	return w
 }
 
-func startClickWorker(pool *pgxpool.Pool) (stop chan struct{}, stopped chan struct{}) {
-	stop = make(chan struct{})
-	stopped = make(chan struct{})
+func (w *Worker) Start() {
 	go func() {
-		defer close(stopped)
-		buf := make([]EventWithCode, 0, 200)
-		ticker := time.NewTicker(400 * time.Millisecond)
+		defer close(w.stopped)
+		ticker := time.NewTicker(w.flushEvery)
 		defer ticker.Stop()
 		for {
+			clickQueueDepth.Set(float64(len(w.ch)))
 			select {
-			case ev := <-clickCh:
-				buf = append(buf, ev)
-				if len(buf) >= 200 {
-					flushClicks(context.Background(), pool, buf)
-					buf = buf[:0]
+			case ev := <-w.ch:
+				w.buf = append(w.buf, ev)
+				if len(w.buf) >= w.maxBatch {
+					w.flush(context.Background())
 				}
 			case <-ticker.C:
-				if len(buf) > 0 {
-					flushClicks(context.Background(), pool, buf)
-					buf = buf[:0]
+				if len(w.buf) > 0 {
+					w.flush(context.Background())
 				}
-			case <-stop:
-				if len(buf) > 0 {
-					flushClicks(context.Background(), pool, buf)
+			case <-w.stop:
+				if len(w.buf) > 0 {
+					w.flush(context.Background())
 				}
 				return
 			}
 		}
 	}()
-	return
 }
 
-func flushClicks(ctx context.Context, pool *pgxpool.Pool, batch []EventWithCode) {
-	if len(batch) == 0 {
+func (w *Worker) Stop() { close(w.stop); <-w.stopped }
+
+func (w *Worker) Enqueue(ev EventWithCode) {
+	select {
+	case w.ch <- ev:
+	default:
+	}
+	clickQueueDepth.Set(float64(len(w.ch)))
+}
+
+func (w *Worker) flush(ctx context.Context) {
+	if len(w.buf) == 0 {
 		return
 	}
-	clickFlushBatchSize.Observe(float64(len(batch)))
-
+	clickFlushBatchSize.Observe(float64(len(w.buf)))
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
 	sb := strings.Builder{}
 	sb.WriteString("INSERT INTO clicks(code, ts, ip, user_agent, device, os, browser) VALUES ")
-	args := make([]any, 0, len(batch)*7)
-	for i, it := range batch {
+	args := make([]any, 0, len(w.buf)*7)
+	for i, it := range w.buf {
 		if i > 0 {
 			sb.WriteByte(',')
 		}
@@ -251,12 +259,16 @@ func flushClicks(ctx context.Context, pool *pgxpool.Pool, batch []EventWithCode)
 		args = append(args, it.Code, it.E.Timestamp, it.E.IP, it.E.UserAgent, it.E.Device, it.E.OS, it.E.Browser)
 	}
 	dbOpsTotal.WithLabelValues("clicks_insert").Inc()
-	if _, err := pool.Exec(ctx, sb.String(), args...); err != nil {
+	if _, err := w.pool.Exec(ctx, sb.String(), args...); err != nil {
 		dbErrorsTotal.WithLabelValues("clicks_insert").Inc()
+		log.Printf("click insert error: %v", err)
 	}
+	w.buf = w.buf[:0]
 }
 
-/* -------------------- persistence & caching -------------------- */
+/* -------------------------------------------------------------------------- */
+/*                                 БД и Кэш                                   */
+/* -------------------------------------------------------------------------- */
 
 var ErrConflict = errors.New("slug already exists")
 
@@ -282,7 +294,7 @@ func (r *pgRepo) Create(ctx context.Context, code, url string) error {
 	if ct.RowsAffected() == 0 {
 		return ErrConflict
 	}
-	return err
+	return nil
 }
 
 func (r *pgRepo) Get(ctx context.Context, code string) (string, bool, error) {
@@ -330,7 +342,9 @@ func (c *redisCache) Set(ctx context.Context, code, url string, ttl time.Duratio
 	return c.client.Set(ctx, c.key(code), url, ttl).Err()
 }
 
-/* -------------------- rate limiting -------------------- */
+/* -------------------------------------------------------------------------- */
+/*                               Rate Limiting                                */
+/* -------------------------------------------------------------------------- */
 
 type Limiter interface {
 	Allow(ctx context.Context, key string) (bool, time.Duration, error)
@@ -394,59 +408,8 @@ func (l *redisLimiter) Allow(ctx context.Context, key string) (bool, time.Durati
 	if waitMs < 100 {
 		waitMs = 100
 	}
+	rateLimitRetryAfter.Observe(waitMs / 1000)
 	return false, time.Duration(waitMs) * time.Millisecond, nil
-}
-
-func shortenHandler(pg *pgRepo, rc *redisCache, baseURL string, idLen int) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		var req struct {
-			URL  string `json:"url" binding:"required,url"`
-			Slug string `json:"slug"`
-		}
-
-		if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.URL) == "" {
-			log.Printf("Invalid URL from client: %v", err)
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
-			return
-		}
-
-		code := strings.TrimSpace(req.Slug)
-		if code == "" {
-			code = genID(idLen)
-		}
-
-		var createErr error
-		for attempt := 0; attempt < 5; attempt++ {
-			createErr = pg.Create(c.Request.Context(), code, req.URL)
-			if createErr == nil {
-				break
-			}
-			if errors.Is(createErr, ErrConflict) {
-				if req.Slug != "" {
-					c.JSON(http.StatusConflict, gin.H{"error": "slug already exists"})
-					return
-				}
-				code = genID(idLen)
-				continue
-			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "db error"})
-			return
-		}
-		if createErr != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not generate unique id"})
-			return
-		}
-
-		if rc != nil {
-			_ = rc.Set(c.Request.Context(), code, req.URL, cacheTTL)
-		}
-
-		short := strings.TrimRight(baseURL, "/") + "/" + code
-		c.JSON(http.StatusOK, gin.H{
-			"code":      code,
-			"short_url": short,
-		})
-	}
 }
 
 func rateLimitMiddleware(l Limiter, keyFunc func(*http.Request) string) gin.HandlerFunc {
@@ -466,51 +429,28 @@ func rateLimitMiddleware(l Limiter, keyFunc func(*http.Request) string) gin.Hand
 	}
 }
 
-/* -------------------- server -------------------- */
+/* -------------------------------------------------------------------------- */
+/*                                   Сервер                                   */
+/* -------------------------------------------------------------------------- */
 
-func main() {
-	ctx := context.Background()
-	port := getenv("PORT", "8080")
-	baseURL := getenv("BASE_URL", "http://localhost:"+port)
-	idLen := 7
+type App struct {
+	cfg     Config
+	pg      *pgRepo
+	cache   *redisCache
+	limiter Limiter
+	worker  *Worker
+	router  *gin.Engine
+}
 
-	rps := 5.0
-	if v := getenv("RATE_LIMIT_RPS", ""); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
-			rps = f
-		}
-	}
-	burst := 20
-	if v := getenv("RATE_LIMIT_BURST", ""); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			burst = n
-		}
-	}
-
-	if ttlSec := getenv("CACHE_TTL_SECONDS", ""); ttlSec != "" {
-		if n, err := strconv.Atoi(ttlSec); err == nil && n > 0 {
-			cacheTTL = time.Duration(n) * time.Second
-		}
-	}
-
-	pgURL := mustEnv("DATABASE_URL")
-	pg, err := newPGRepo(ctx, pgURL)
+func newApp(ctx context.Context, cfg Config) (*App, error) {
+	pg, err := newPGRepo(ctx, cfg.DBURL)
 	if err != nil {
-		log.Fatalf("failed to connect to postgres: %v", err)
+		return nil, fmt.Errorf("postgres connect: %w", err)
 	}
-	defer pg.pool.Close()
 
-	redisAddr := getenv("REDIS_ADDR", "")
 	var rc *redisCache
-	if redisAddr != "" {
-		redisPass := getenv("REDIS_PASSWORD", "")
-		redisDB := 0
-		if v := getenv("REDIS_DB", ""); v != "" {
-			if n, err := strconv.Atoi(v); err == nil {
-				redisDB = n
-			}
-		}
-		rc = newRedis(redisAddr, redisPass, redisDB)
+	if cfg.RedisAddr != "" {
+		rc = newRedis(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
 		if err := rc.client.Ping(ctx).Err(); err != nil {
 			log.Printf("warning: redis ping failed: %v (continuing without cache)", err)
 			rc = nil
@@ -518,60 +458,119 @@ func main() {
 			log.Printf("redis connected")
 		}
 	}
+
 	var limiter Limiter
 	if rc != nil && rc.client != nil {
-		limiter, err = newRedisLimiter(rps, burst, rc.client, "token_bucket.lua")
+		limiter, err = newRedisLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst, rc.client, cfg.RateLimitLuaPath)
 		if err != nil {
-			log.Fatalf("rate limiter: %v", err)
+			return nil, fmt.Errorf("rate limiter: %w", err)
 		}
 	}
+
+	w := newWorker(pg.pool, cfg.ClickBufSize, 200, cfg.ClickFlushEvery)
+	w.Start()
 
 	r := gin.Default()
 	r.Use(promHTTPMiddleware())
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
-	h := shortenHandler(pg, rc, baseURL, idLen)
-	if limiter != nil {
-		r.POST("/api/shorten", rateLimitMiddleware(limiter, getClientIP), h)
+	app := &App{cfg: cfg, pg: pg, cache: rc, limiter: limiter, worker: w, router: r}
+	app.routes()
+	return app, nil
+}
+
+func (a *App) Close() {
+	if a.worker != nil {
+		a.worker.Stop()
+	}
+	if a.pg != nil && a.pg.pool != nil {
+		a.pg.pool.Close()
+	}
+}
+
+func (a *App) routes() {
+	h := a.shortenHandler()
+	if a.limiter != nil {
+		a.router.POST("/api/shorten", rateLimitMiddleware(a.limiter, getClientIP), h)
 	} else {
-		r.POST("/api/shorten", h)
+		a.router.POST("/api/shorten", h)
 	}
 
-	stop, stopped := startClickWorker(pg.pool)
-	defer func() { close(stop); <-stopped }()
+	a.router.GET("/api/analytics/:code", a.analyticsHandler())
+	a.router.GET("/favicon.ico", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	a.router.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true}) })
+	a.router.GET("/:code", a.redirectHandler())
+}
 
-	r.GET("/api/analytics/:code", func(c *gin.Context) {
-		code := c.Param("code")
-		limit := 100
-		if q := strings.TrimSpace(c.Query("limit")); q != "" {
-			if n, err := strconv.Atoi(q); err == nil && n > 0 {
-				limit = n
-			}
+func (a *App) shortenHandler() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req struct {
+			URL  string `json:"url" binding:"required,url"`
+			Slug string `json:"slug"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.URL) == "" {
+			log.Printf("invalid shorten body: %v", err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+			return
 		}
 
+		code := strings.TrimSpace(req.Slug)
+		if code == "" {
+			code = genID(a.cfg.IDLen)
+		}
+
+		var createErr error
+		for attempt := 0; attempt < 5; attempt++ {
+			createErr = a.pg.Create(c.Request.Context(), code, req.URL)
+			if createErr == nil {
+				break
+			}
+			if errors.Is(createErr, ErrConflict) {
+				if req.Slug != "" {
+					c.JSON(http.StatusConflict, gin.H{"error": "slug already exists"})
+					return
+				}
+				code = genID(a.cfg.IDLen)
+				continue
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "db error"})
+			return
+		}
+		if createErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not generate unique id"})
+			return
+		}
+
+		if a.cache != nil {
+			_ = a.cache.Set(c.Request.Context(), code, req.URL, a.cfg.CacheTTL)
+		}
+
+		short := strings.TrimRight(a.cfg.BaseURL, "/") + "/" + code
+		c.JSON(http.StatusOK, gin.H{"code": code, "short_url": short})
+	}
+}
+
+func (a *App) analyticsHandler() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		code := c.Param("code")
+		limit := atoi(strings.TrimSpace(c.Query("limit")), 100)
 		ctx := c.Request.Context()
 
 		var total int64
 		var last *time.Time
-		err := pg.pool.QueryRow(ctx, `
-			SELECT COUNT(*) as total, MAX(ts) AS last
-			FROM clicks WHERE code = $1`, code).Scan(&total, &last)
+		err := a.pg.pool.QueryRow(ctx, `SELECT COUNT(*) as total, MAX(ts) AS last FROM clicks WHERE code = $1`, code).Scan(&total, &last)
 		dbOpsTotal.WithLabelValues("analytics_summary").Inc()
 		if err != nil {
 			dbErrorsTotal.WithLabelValues("analytics_summary").Inc()
-			c.JSON(500, gin.H{"error": "db error"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "db error"})
 			return
 		}
 
-		rows, err := pg.pool.Query(ctx, `
-			SELECT ts, ip, user_agent, device, os, browser
-			FROM clicks WHERE code = $1
-			ORDER BY ts DESC
-			LIMIT $2`, code, limit)
+		rows, err := a.pg.pool.Query(ctx, `SELECT ts, ip, user_agent, device, os, browser FROM clicks WHERE code = $1 ORDER BY ts DESC LIMIT $2`, code, limit)
 		dbOpsTotal.WithLabelValues("analytics_recent").Inc()
 		if err != nil {
 			dbErrorsTotal.WithLabelValues("analytics_recent").Inc()
-			c.JSON(500, gin.H{"error": "db error"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "db error"})
 			return
 		}
 		defer rows.Close()
@@ -581,41 +580,29 @@ func main() {
 			var e Event
 			var ip sql.NullString
 			if err := rows.Scan(&e.Timestamp, &ip, &e.UserAgent, &e.Device, &e.OS, &e.Browser); err != nil {
-				c.JSON(500, gin.H{"error": "scan error"})
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "scan error"})
 				return
 			}
 			e.IP = ip.String
 			eventsOut = append(eventsOut, e)
 		}
-		c.JSON(http.StatusOK, gin.H{
-			"code":  code,
-			"total": total,
-			"last_click": func() *time.Time {
-				if last == nil {
-					return nil
-				}
-				return last
-			}(),
-			"recent": eventsOut,
-		})
-	})
+		c.JSON(http.StatusOK, gin.H{"code": code, "total": total, "last_click": last, "recent": eventsOut})
+	}
+}
 
-	r.GET("/favicon.ico", func(c *gin.Context) {
-		c.Status(http.StatusNoContent)
-	})
-
-	r.GET("/:code", func(c *gin.Context) {
+func (a *App) redirectHandler() gin.HandlerFunc {
+	return func(c *gin.Context) {
 		code := c.Param("code")
 		ctx := c.Request.Context()
 
-		if rc != nil {
-			if url, ok, err := rc.Get(ctx, code); err == nil && ok {
-				recordAndRedirect(c, code, url)
+		if a.cache != nil {
+			if url, ok, err := a.cache.Get(ctx, code); err == nil && ok {
+				a.recordAndRedirect(c, code, url)
 				return
 			}
 		}
 
-		url, exists, err := pg.Get(ctx, code)
+		url, exists, err := a.pg.Get(ctx, code)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "db error"})
 			return
@@ -625,39 +612,61 @@ func main() {
 			return
 		}
 
-		if rc != nil {
-			_ = rc.Set(ctx, code, url, cacheTTL)
+		if a.cache != nil {
+			_ = a.cache.Set(ctx, code, url, a.cfg.CacheTTL)
 		}
-		recordAndRedirect(c, code, url)
-	})
-
-	r.GET("/healthz", func(c *gin.Context) {
-		c.JSON(200, gin.H{"ok": true})
-	})
-
-	_ = r.Run(":" + port)
+		a.recordAndRedirect(c, code, url)
+	}
 }
 
-func recordAndRedirect(c *gin.Context, code, url string) {
+func (a *App) recordAndRedirect(c *gin.Context, code, url string) {
 	ua := c.Request.UserAgent()
 	device, osName, browser := parseUA(ua)
-
-	evt := Event{
-		Timestamp: time.Now().UTC(),
-		IP:        getClientIP(c.Request),
-		UserAgent: ua,
-		Device:    device,
-		OS:        osName,
-		Browser:   browser,
+	evt := Event{Timestamp: time.Now().UTC(), IP: getClientIP(c.Request), UserAgent: ua, Device: device, OS: osName, Browser: browser}
+	if a.worker != nil {
+		a.worker.Enqueue(EventWithCode{Code: code, E: evt})
 	}
-
-	select {
-	case clickCh <- EventWithCode{Code: code, E: evt}:
-	default:
-	}
-
 	redirectsTotal.WithLabelValues(code).Inc()
 	c.Redirect(http.StatusFound, url)
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                  Утилиты                                   */
+/* -------------------------------------------------------------------------- */
+
+func getClientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		for _, part := range strings.Split(xff, ",") {
+			ip := strings.TrimSpace(part)
+			if ip != "" {
+				return ip
+			}
+		}
+	}
+	if xrip := r.Header.Get("X-Real-IP"); xrip != "" {
+		return strings.TrimSpace(xrip)
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+func parseUA(uaStr string) (device, os, browser string) {
+	ua := uaParser.New(uaStr)
+	browserName, _ := ua.Browser()
+	browser = browserName
+	os = ua.OS()
+	switch {
+	case ua.Bot():
+		device = "bot"
+	case ua.Mobile():
+		device = "mobile"
+	default:
+		device = "desktop"
+	}
+	return
 }
 
 func genID(n int) string {
@@ -675,11 +684,46 @@ func getenv(k, def string) string {
 	}
 	return def
 }
-
 func mustEnv(k string) string {
 	v := os.Getenv(k)
 	if v == "" {
 		log.Fatalf("missing required env var %s", k)
 	}
 	return v
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                     Main                                   */
+/* -------------------------------------------------------------------------- */
+
+func main() {
+	cfg := loadConfig()
+	ctx := context.Background()
+
+	app, err := newApp(ctx, cfg)
+	if err != nil {
+		log.Fatalf("boot error: %v", err)
+	}
+	defer app.Close()
+
+	srv := &http.Server{Addr: ":" + cfg.Port, Handler: app.router}
+
+	// graceful shutdown
+	idleConnsClosed := make(chan struct{})
+	go func() {
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
+		<-ch
+		log.Printf("shutting down...")
+		ctx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownGrace)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+		close(idleConnsClosed)
+	}()
+
+	log.Printf("listening on :%s", cfg.Port)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatalf("http server error: %v", err)
+	}
+	<-idleConnsClosed
 }
