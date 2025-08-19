@@ -1,4 +1,4 @@
-# Сокращатель URL — Go + Gin + Postgres + Redis + Prometheus
+# Сокращатель URL — Go + Gin + Postgres + Redis + Prometheus + Grafana
 
 Сокращатель URL с аналитикой кликов, кэшированием Redis, token-bucket rate limiting, и метриками Prometheus.
 
@@ -17,6 +17,8 @@
 **Батчинг** эвентов кликов в БД
 
 **Эндпоинты** состояния и диагностики
+
+**Grafana**
 
 ## Архитектура
 
@@ -128,4 +130,5 @@ docker compose up --build
    Приложение  → http://localhost:8080
    Healthcheck → http://localhost:8080/healthz
    Метрики    → http://localhost:8080/metrics
+   Grafana    → http://localhost:9090
 ```
