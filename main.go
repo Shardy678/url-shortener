@@ -78,7 +78,7 @@ var (
 			Name: "db_ops_total",
 			Help: "Database operations.",
 		},
-		[]string{"op"}, // create_url, get_url, clicks_insert, analytics_summary, analytics_recent
+		[]string{"op"},
 	)
 	dbErrorsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -132,7 +132,7 @@ func promHTTPMiddleware() gin.HandlerFunc {
 		dur := time.Since(start).Seconds()
 
 		route := c.FullPath()
-		if route == "" { // for 404s or not-matched routes
+		if route == "" {
 			route = "unmatched"
 		}
 		status := strconv.Itoa(c.Writer.Status())
@@ -404,20 +404,17 @@ func shortenHandler(pg *pgRepo, rc *redisCache, baseURL string, idLen int) gin.H
 			Slug string `json:"slug"`
 		}
 
-		// validate input
 		if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.URL) == "" {
 			log.Printf("Invalid URL from client: %v", err)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 			return
 		}
 
-		// pick code (custom slug or random)
 		code := strings.TrimSpace(req.Slug)
 		if code == "" {
 			code = genID(idLen)
 		}
 
-		// try to create, retry on conflict (regenerate only if no custom slug)
 		var createErr error
 		for attempt := 0; attempt < 5; attempt++ {
 			createErr = pg.Create(c.Request.Context(), code, req.URL)
@@ -425,16 +422,13 @@ func shortenHandler(pg *pgRepo, rc *redisCache, baseURL string, idLen int) gin.H
 				break
 			}
 			if errors.Is(createErr, ErrConflict) {
-				// custom slug taken -> immediate 409
 				if req.Slug != "" {
 					c.JSON(http.StatusConflict, gin.H{"error": "slug already exists"})
 					return
 				}
-				// otherwise regenerate and try again
 				code = genID(idLen)
 				continue
 			}
-			// other DB error
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "db error"})
 			return
 		}
@@ -443,12 +437,10 @@ func shortenHandler(pg *pgRepo, rc *redisCache, baseURL string, idLen int) gin.H
 			return
 		}
 
-		// warm cache
 		if rc != nil {
 			_ = rc.Set(c.Request.Context(), code, req.URL, cacheTTL)
 		}
 
-		// respond
 		short := strings.TrimRight(baseURL, "/") + "/" + code
 		c.JSON(http.StatusOK, gin.H{
 			"code":      code,
@@ -482,13 +474,13 @@ func main() {
 	baseURL := getenv("BASE_URL", "http://localhost:"+port)
 	idLen := 7
 
-	rps := 5.0 // tokens per second
+	rps := 5.0
 	if v := getenv("RATE_LIMIT_RPS", ""); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
 			rps = f
 		}
 	}
-	burst := 20 // bucket size
+	burst := 20
 	if v := getenv("RATE_LIMIT_BURST", ""); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			burst = n
