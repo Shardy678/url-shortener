@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/joho/godotenv"
 
 	"url-shortener/internal/analytics"
 	"url-shortener/internal/cache"
@@ -21,6 +22,11 @@ import (
 )
 
 func main() {
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatal("Error loading .env file")
+	}
+
 	cfg := config.Load()
 	ctx := context.Background()
 
@@ -34,7 +40,7 @@ func main() {
 	}
 	defer pool.Close()
 
-	// Redis (optional)
+	// Redis
 	var rc *cache.Redis
 	if cfg.RedisAddr != "" {
 		rc = cache.New(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
@@ -46,7 +52,7 @@ func main() {
 		}
 	}
 
-	// Rate limiter (optional)
+	// Rate limiter
 	var limiter ratelimit.Limiter
 	if rc != nil {
 		limiter, err = ratelimit.NewRedisLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst, rc.Client, cfg.RateLimitLuaPath)

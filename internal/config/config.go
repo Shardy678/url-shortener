@@ -28,7 +28,7 @@ func Load() Config {
 		Port:             getenv("PORT", "8080"),
 		IDLen:            atoi(getenv("ID_LEN", "7"), 7),
 		DBURL:            mustEnv("DATABASE_URL"),
-		RedisAddr:        getenv("REDIS_ADDR", ""),
+		RedisAddr:        getenv("REDIS_URL", ""),
 		RedisPassword:    getenv("REDIS_PASSWORD", ""),
 		RedisDB:          atoi(getenv("REDIS_DB", "0"), 0),
 		CacheTTL:         dur(getenv("CACHE_TTL", "24h"), 24*time.Hour),

@@ -3,6 +3,7 @@ package httpapi
 import (
 	"database/sql"
 	"errors"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -78,6 +79,7 @@ func (a *App) shortenHandler() gin.HandlerFunc {
 				continue
 			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "db error"})
+			log.Printf("create url: %v", createErr)
 			return
 		}
 		if createErr != nil {
