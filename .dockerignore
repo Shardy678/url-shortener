@@ -1,0 +1,34 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Build artifacts
+bin/
+build/
+dist/
+
+# Vendor (if you use go modules, you don’t need vendor inside the image)
+vendor/
+
+# Logs
+*.log
+
+# Dependency / editor files
+.idea/
+.vscode/
+*.swp
+
+# Git & config
+.git
+.gitignore
+.dockerignore
+
+# Environment & secrets
+.env
+*.pem
+*.key
