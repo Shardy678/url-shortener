@@ -28,20 +28,3 @@ jobs:
       - name: Run tests
         run: go test ./... -v -race -count=1
 
-  deploy:
-    needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Heroku CLI
-        run: curl https://cli-assets.heroku.com/install.sh | sh
-
-      - name: Deploy to Heroku (buildpack)
-        env:
-          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
-          HEROKU_APP: url-shortener-go
-        run: |
-          heroku git:remote -a "$HEROKU_APP"
-          git push heroku HEAD:main -f
