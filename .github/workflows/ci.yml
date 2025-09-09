@@ -1,9 +1,7 @@
 name: CI
 on:
-  workflow_dispatch:
-  pull_request:
-  push:
-    branches: [ main ]
+  push:               
+  workflow_dispatch:  
 
 jobs:
   test:
@@ -13,7 +11,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'   
+          go-version: '1.24'  
 
       - name: Cache Go modules
         uses: actions/cache@v4
@@ -32,7 +30,7 @@ jobs:
 
   deploy:
     needs: test
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
