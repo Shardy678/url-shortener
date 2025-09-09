@@ -90,9 +90,35 @@ func (a *App) shortenHandler() gin.HandlerFunc {
 		if a.Cache != nil {
 			_ = a.Cache.Set(c.Request.Context(), code, req.URL, a.Cfg.CacheTTL)
 		}
-		short := strings.TrimRight(a.Cfg.BaseURL, "/") + "/" + code
-		c.JSON(http.StatusOK, gin.H{"code": code, "short_url": short})
+		shortURL := baseURLFromRequest(c, a.Cfg.BaseURL) + "/" + code
+		c.JSON(http.StatusOK, gin.H{"code": code, "short_url": shortURL})
 	}
+}
+
+func baseURLFromRequest(c *gin.Context, envBase string) string {
+	if envBase != "" && !strings.Contains(envBase, "localhost") {
+		return strings.TrimRight(envBase, "/")
+	}
+
+	scheme := c.GetHeader("X-Forwarded-Proto")
+	if scheme == "" {
+		if c.Request.TLS != nil {
+			scheme = "https"
+		} else {
+			scheme = "http"
+		}
+	} else {
+		scheme = strings.Split(scheme, ",")[0]
+	}
+
+	host := c.GetHeader("X-Forwarded-Host")
+	if host == "" {
+		host = c.Request.Host
+	} else {
+		host = strings.Split(host, ",")[0]
+	}
+
+	return scheme + "://" + host
 }
 
 func (a *App) analyticsHandler() gin.HandlerFunc {
